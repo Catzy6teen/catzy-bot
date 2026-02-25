@@ -7,31 +7,32 @@ from telegram.ext import (
     CallbackQueryHandler
 )
 from groq import Groq
-import sqlite3
+import psycopg2
 import os
 
 # ================= CONFIG =================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID"))
+DATABASE_URL = os.environ.get("DATABASE_URL")
 # ==========================================
 
 # Safety check
-if not TELEGRAM_TOKEN or not GROQ_API_KEY or not CHANNEL_ID:
+if not TELEGRAM_TOKEN or not GROQ_API_KEY or not CHANNEL_ID or not DATABASE_URL:
     raise ValueError("Missing environment variables!")
 
 # Groq AI setup
 client = Groq(api_key=GROQ_API_KEY)
 
-# Database setup
-conn = sqlite3.connect("movies.db")
+# PostgreSQL connection
+conn = psycopg2.connect(DATABASE_URL)
 cursor = conn.cursor()
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS movies (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     movie_name TEXT,
-    message_id INTEGER
+    message_id BIGINT
 )
 """)
 conn.commit()
@@ -43,7 +44,7 @@ async def save_movie(update, context):
         msg = update.channel_post
         if (msg.document or msg.video) and msg.caption:
             cursor.execute(
-                "INSERT INTO movies (movie_name, message_id) VALUES (?, ?)",
+                "INSERT INTO movies (movie_name, message_id) VALUES (%s, %s)",
                 (msg.caption, msg.message_id)
             )
             conn.commit()
@@ -55,7 +56,7 @@ async def auto_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 1️⃣ Search movie database
     cursor.execute(
-        "SELECT id, movie_name FROM movies WHERE movie_name LIKE ?",
+        "SELECT id, movie_name FROM movies WHERE movie_name ILIKE %s",
         ('%' + user_text + '%',)
     )
     results = cursor.fetchall()
@@ -94,7 +95,7 @@ async def send_movie(update, context):
     movie_id = query.data
 
     cursor.execute(
-        "SELECT message_id FROM movies WHERE id=?",
+        "SELECT message_id FROM movies WHERE id=%s",
         (movie_id,)
     )
     result = cursor.fetchone()
@@ -114,5 +115,5 @@ app.add_handler(MessageHandler(filters.ChatType.CHANNEL, save_movie))
 app.add_handler(CallbackQueryHandler(send_movie))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_handler))
 
-print("Bot is running...")
+print("Bot is running with PostgreSQL...")
 app.run_polling()
