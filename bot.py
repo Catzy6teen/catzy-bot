@@ -10,22 +10,38 @@ from groq import Groq
 import psycopg2
 import os
 
-# ================= CONFIG =================
+# ================== CONFIG (FROM RAILWAY VARIABLES) ==================
+
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID"))
+CHANNEL_ID = os.environ.get("CHANNEL_ID")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-# ==========================================
 
-# Safety check
-if not TELEGRAM_TOKEN or not GROQ_API_KEY or not CHANNEL_ID or not DATABASE_URL:
-    raise ValueError("Missing environment variables!")
+# ================== SAFETY CHECK ==================
 
-# Groq AI setup
+if not TELEGRAM_TOKEN:
+    raise ValueError("TELEGRAM_TOKEN missing")
+
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY missing")
+
+if not CHANNEL_ID:
+    raise ValueError("CHANNEL_ID missing")
+
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL missing")
+
+CHANNEL_ID = int(CHANNEL_ID)
+
+# ================== GROQ SETUP ==================
 client = Groq(api_key=GROQ_API_KEY)
 
-# PostgreSQL connection
-conn = psycopg2.connect(DATABASE_URL)
+# ================== DATABASE HELPER ==================
+def get_db():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+# ================== CREATE TABLE ==================
+conn = get_db()
 cursor = conn.cursor()
 
 cursor.execute("""
@@ -35,44 +51,64 @@ CREATE TABLE IF NOT EXISTS movies (
     message_id BIGINT
 )
 """)
+
 conn.commit()
+cursor.close()
+conn.close()
 
-
-# ========= AUTO SAVE MOVIES FROM CHANNEL =========
+# ================== SAVE MOVIES FROM CHANNEL ==================
 async def save_movie(update, context):
     if update.channel_post:
         msg = update.channel_post
+
         if (msg.document or msg.video) and msg.caption:
+            movie_name = msg.caption.split("\n")[0].strip()
+
+            conn = get_db()
+            cursor = conn.cursor()
+
             cursor.execute(
                 "INSERT INTO movies (movie_name, message_id) VALUES (%s, %s)",
-                (msg.caption, msg.message_id)
+                (movie_name, msg.message_id)
             )
+
             conn.commit()
+            cursor.close()
+            conn.close()
 
-
-# ========= AUTO HANDLER (Movie First, AI Fallback) =========
+# ================== AUTO HANDLER ==================
 async def auto_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
 
-    # 1️⃣ Search movie database
+    if not update.message or not update.message.text:
+        return
+
+    user_text = update.message.text.strip()
+
+    conn = get_db()
+    cursor = conn.cursor()
+
     cursor.execute(
         "SELECT id, movie_name FROM movies WHERE movie_name ILIKE %s",
         ('%' + user_text + '%',)
     )
+
     results = cursor.fetchall()
+    cursor.close()
+    conn.close()
 
     if results:
         buttons = [
             [InlineKeyboardButton(movie[1], callback_data=str(movie[0]))]
             for movie in results[:5]
         ]
+
         await update.message.reply_text(
             "🎬 Movies Found:",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
         return
 
-    # 2️⃣ If no movie found → AI reply
+    # ---------- AI Fallback ----------
     try:
         response = client.chat.completions.create(
             model="llama-3.1-8b-instant",
@@ -80,40 +116,45 @@ async def auto_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 {"role": "user", "content": user_text}
             ]
         )
+
         reply = response.choices[0].message.content
         await update.message.reply_text(reply)
 
     except Exception as e:
-        await update.message.reply_text("Error: " + str(e))
+        await update.message.reply_text("AI Error")
 
-
-# ========= SEND MOVIE ON BUTTON CLICK =========
+# ================== SEND MOVIE ==================
 async def send_movie(update, context):
     query = update.callback_query
     await query.answer()
 
     movie_id = query.data
 
+    conn = get_db()
+    cursor = conn.cursor()
+
     cursor.execute(
         "SELECT message_id FROM movies WHERE id=%s",
         (movie_id,)
     )
+
     result = cursor.fetchone()
+    cursor.close()
+    conn.close()
 
     if result:
         await context.bot.forward_message(
-            chat_id=query.message.chat_id,
+            chat_id=query.message.chat.chat_id,
             from_chat_id=CHANNEL_ID,
             message_id=result[0]
         )
 
-
-# ========= BUILD APP =========
+# ================== BUILD APP ==================
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
 app.add_handler(MessageHandler(filters.ChatType.CHANNEL, save_movie))
 app.add_handler(CallbackQueryHandler(send_movie))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_handler))
 
-print("Bot is running with PostgreSQL...")
+print("Bot running with Railway PostgreSQL...")
 app.run_polling()
